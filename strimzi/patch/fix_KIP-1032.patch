@@ -1,0 +1,440 @@
+Subject: [PATCH] fix KIP-1032
+---
+Index: kafka-agent/src/test/java/io/strimzi/kafka/agent/KafkaAgentTest.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/kafka-agent/src/test/java/io/strimzi/kafka/agent/KafkaAgentTest.java b/kafka-agent/src/test/java/io/strimzi/kafka/agent/KafkaAgentTest.java
+--- a/kafka-agent/src/test/java/io/strimzi/kafka/agent/KafkaAgentTest.java	(revision d91e4044f42dde29bec1c8f5a710a6e9c61b6b63)
++++ b/kafka-agent/src/test/java/io/strimzi/kafka/agent/KafkaAgentTest.java	(date 1735547602000)
+@@ -5,6 +5,7 @@
+ package io.strimzi.kafka.agent;
+ 
+ import com.yammer.metrics.core.Gauge;
++import jakarta.servlet.http.HttpServletResponse;
+ import org.eclipse.jetty.server.Connector;
+ import org.eclipse.jetty.server.Server;
+ import org.eclipse.jetty.server.ServerConnector;
+@@ -13,8 +14,6 @@
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ 
+-import javax.servlet.http.HttpServletResponse;
+-
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.net.http.HttpClient;
+Index: kafka-agent/src/main/java/io/strimzi/kafka/agent/KafkaAgent.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/kafka-agent/src/main/java/io/strimzi/kafka/agent/KafkaAgent.java b/kafka-agent/src/main/java/io/strimzi/kafka/agent/KafkaAgent.java
+--- a/kafka-agent/src/main/java/io/strimzi/kafka/agent/KafkaAgent.java	(revision d91e4044f42dde29bec1c8f5a710a6e9c61b6b63)
++++ b/kafka-agent/src/main/java/io/strimzi/kafka/agent/KafkaAgent.java	(date 1735639024000)
+@@ -10,11 +10,15 @@
+ import com.yammer.metrics.core.MetricName;
+ import com.yammer.metrics.core.MetricsRegistry;
+ import com.yammer.metrics.core.MetricsRegistryListener;
++import jakarta.servlet.http.HttpServletResponse;
++import org.eclipse.jetty.http.HttpHeader;
++import org.eclipse.jetty.io.Content;
+ import org.eclipse.jetty.server.Connector;
+ import org.eclipse.jetty.server.Handler;
+ import org.eclipse.jetty.server.HttpConfiguration;
+ import org.eclipse.jetty.server.HttpConnectionFactory;
+ import org.eclipse.jetty.server.Request;
++import org.eclipse.jetty.server.Response;
+ import org.eclipse.jetty.server.SecureRequestCustomizer;
+ import org.eclipse.jetty.server.Server;
+ import org.eclipse.jetty.server.ServerConnector;
+@@ -22,13 +26,11 @@
+ import org.eclipse.jetty.server.handler.AbstractHandler;
+ import org.eclipse.jetty.server.handler.ContextHandler;
+ import org.eclipse.jetty.server.handler.ContextHandlerCollection;
++import org.eclipse.jetty.util.Callback;
+ import org.eclipse.jetty.util.ssl.SslContextFactory;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import javax.servlet.http.HttpServletRequest;
+-import javax.servlet.http.HttpServletResponse;
+-
+ import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.lang.reflect.InvocationTargetException;
+@@ -56,6 +58,8 @@
+  *     </dd>
+  * </dl>
+  */
++
++@SuppressWarnings("deprecation")
+ public class KafkaAgent {
+     private static final Logger LOGGER = LoggerFactory.getLogger(KafkaAgent.class);
+     private static final String BROKER_STATE_PATH = "/v1/broker-state";
+@@ -78,14 +82,15 @@
+     private Gauge brokerState;
+     private Gauge remainingLogsToRecover;
+     private Gauge remainingSegmentsToRecover;
++    private boolean isController = false;
+ 
+     /**
+      * Constructor of the KafkaAgent
+      *
+-     * @param sslKeyStorePath       Keystore containing the broker certificate
+-     * @param sslKeyStorePass       Password for keystore
+-     * @param sslTruststorePath     Truststore containing CA certs for authenticating clients
+-     * @param sslTruststorePass     Password for truststore
++     * @param sslKeyStorePath   Keystore containing the broker certificate
++     * @param sslKeyStorePass   Password for keystore
++     * @param sslTruststorePath Truststore containing CA certs for authenticating clients
++     * @param sslTruststorePass Password for truststore
+      */
+     /* test */ KafkaAgent(String sslKeyStorePath, String sslKeyStorePass, String sslTruststorePath, String sslTruststorePass) {
+         this.sslKeyStorePath = sslKeyStorePath;
+@@ -97,9 +102,9 @@
+     /**
+      * Constructor of the KafkaAgent
+      *
+-     * @param brokerState                   Current state of the broker
+-     * @param remainingLogsToRecover        Number of remaining logs to recover
+-     * @param remainingSegmentsToRecover    Number of remaining segments to recover
++     * @param brokerState                Current state of the broker
++     * @param remainingLogsToRecover     Number of remaining logs to recover
++     * @param remainingSegmentsToRecover Number of remaining segments to recover
+      */
+     /* test */ KafkaAgent(Gauge brokerState, Gauge remainingLogsToRecover, Gauge remainingSegmentsToRecover) {
+         this.brokerState = brokerState;
+@@ -107,6 +112,50 @@
+         this.remainingSegmentsToRecover = remainingSegmentsToRecover;
+     }
+ 
++    /**
++     * Agent entry point
++     *
++     * @param agentArgs The agent arguments
++     */
++    public static void premain(String agentArgs) {
++        String[] args = agentArgs.split(";");
++        if (args.length != 1) {
++            LOGGER.error("Not enough arguments to parse {}", agentArgs);
++            System.exit(1);
++        } else {
++            final Properties agentProperties = new Properties();
++            final Map<String, String> agentConfigs = new HashMap<>();
++
++            try (FileInputStream fis = new FileInputStream(args[0])) {
++                agentProperties.load(fis);
++                for (String key : agentProperties.stringPropertyNames()) {
++                    agentConfigs.put(key, agentProperties.getProperty(key));
++                }
++            } catch (IOException e) {
++                LOGGER.error("Could not read and parse properties file {}", args[0]);
++                System.exit(1);
++            }
++
++            final String sslKeyStorePath = agentConfigs.get("sslKeyStorePath");
++            final String sslKeyStorePass = agentConfigs.get("sslKeyStorePass");
++            final String sslTrustStorePath = agentConfigs.get("sslTrustStorePath");
++            final String sslTrustStorePass = agentConfigs.get("sslTrustStorePass");
++            if (sslKeyStorePath.isEmpty() || sslTrustStorePath.isEmpty()) {
++                LOGGER.error("SSLKeyStorePath or SSLTrustStorePath is empty: sslKeyStorePath={} sslTrustStore={} ", sslKeyStorePath, sslTrustStorePath);
++                System.exit(1);
++            } else if (sslKeyStorePass.isEmpty()) {
++                LOGGER.error("Keystore password is empty");
++                System.exit(1);
++            } else if (sslTrustStorePass.isEmpty()) {
++                LOGGER.error("Truststore password is empty");
++                System.exit(1);
++            } else {
++                LOGGER.info("Starting KafkaAgent with sslKeyStorePath={} and sslTrustStore={}", sslKeyStorePath, sslTrustStorePath);
++                new KafkaAgent(sslKeyStorePath, sslKeyStorePass, sslTrustStorePath, sslTrustStorePass).run();
++            }
++        }
++    }
++
+     private void run() {
+         try {
+             startHttpServer();
+@@ -126,6 +175,10 @@
+             @Override
+             public synchronized void onMetricAdded(MetricName metricName, Metric metric) {
+                 LOGGER.debug("Metric added {}", metricName);
++
++                if ("ControllerServer".equals(metricName.getType()))
++                    isController = true;
++
+                 if (isBrokerState(metricName) && metric instanceof Gauge) {
+                     brokerStateName = metricName;
+                     brokerState = (Gauge) metric;
+@@ -142,9 +195,9 @@
+      * Acquires the MetricsRegistry from the KafkaYammerMetrics class. Depending on the Kafka version we are on, it will
+      * use reflection to use the right class to get it.
+      *
+-     * @return  Metrics Registry object
++     * @return Metrics Registry object
+      */
+-    private MetricsRegistry metricsRegistry()   {
++    private MetricsRegistry metricsRegistry() {
+         Object metricsRegistry;
+         Class<?> yammerMetrics;
+ 
+@@ -152,7 +205,7 @@
+             // First we try to get the KafkaYammerMetrics class for Kafka 3.3+
+             yammerMetrics = Class.forName(YAMMER_METRICS_IN_KAFKA_3_3_AND_LATER);
+             LOGGER.info("Found class {} for Kafka 3.3 and newer.", YAMMER_METRICS_IN_KAFKA_3_3_AND_LATER);
+-        } catch (ClassNotFoundException e)    {
++        } catch (ClassNotFoundException e) {
+             LOGGER.info("Class {} not found. We are probably on Kafka 3.2 or older.", YAMMER_METRICS_IN_KAFKA_3_3_AND_LATER);
+             throw new RuntimeException("Failed to find Yammer Metrics class", e);
+         }
+@@ -176,11 +229,13 @@
+                 && "kafka.server".equals(name.getGroup())
+                 && "KafkaServer".equals(name.getType());
+     }
++
+     private boolean isRemainingLogsToRecover(MetricName name) {
+         return "remainingLogsToRecover".equals(name.getName())
+                 && "kafka.log".equals(name.getGroup())
+                 && "LogManager".equals(name.getType());
+     }
++
+     private boolean isRemainingSegmentsToRecover(MetricName name) {
+         return "remainingSegmentsToRecover".equals(name.getName())
+                 && "kafka.log".equals(name.getGroup())
+@@ -188,33 +243,37 @@
+     }
+ 
+     private void startHttpServer() throws Exception {
+-        Server server = new Server();
++        try {
++            Server server = new Server();
+ 
+-        HttpConfiguration https = new HttpConfiguration();
+-        https.addCustomizer(new SecureRequestCustomizer());
+-        ServerConnector httpsConn = new ServerConnector(server,
+-                new SslConnectionFactory(getSSLContextFactory(), "http/1.1"),
+-                new HttpConnectionFactory(https));
+-        httpsConn.setHost("0.0.0.0");
+-        httpsConn.setPort(HTTPS_PORT);
++            HttpConfiguration https = new HttpConfiguration();
++            https.addCustomizer(new SecureRequestCustomizer());
++            ServerConnector httpsConn = new ServerConnector(server,
++                    new SslConnectionFactory(getSSLContextFactory(), "http/1.1"),
++                    new HttpConnectionFactory(https));
++            httpsConn.setHost("0.0.0.0");
++            httpsConn.setPort(HTTPS_PORT);
+ 
+-        ContextHandler brokerStateContext = new ContextHandler(BROKER_STATE_PATH);
+-        brokerStateContext.setHandler(getBrokerStateHandler());
++            ContextHandler brokerStateContext = new ContextHandler(BROKER_STATE_PATH);
++            brokerStateContext.setHandler(getBrokerStateHandler());
+ 
+-        ServerConnector httpConn  = new ServerConnector(server);
+-        // The HTTP port should not be exposed outside the Pod, so it listens only on localhost
+-        httpConn.setHost("localhost");
+-        httpConn.setPort(HTTP_PORT);
++            ServerConnector httpConn = new ServerConnector(server);
++            // The HTTP port should not be exposed outside the Pod, so it listens only on localhost
++            httpConn.setHost("localhost");
++            httpConn.setPort(HTTP_PORT);
+ 
+-        ContextHandler readinessContext = new ContextHandler(READINESS_ENDPOINT_PATH);
+-        readinessContext.setHandler(getReadinessHandler());
++            ContextHandler readinessContext = new ContextHandler(READINESS_ENDPOINT_PATH);
++            readinessContext.setHandler(getReadinessHandler());
+ 
+-        server.setConnectors(new Connector[] {httpsConn, httpConn});
+-        server.setHandler(new ContextHandlerCollection(brokerStateContext, readinessContext));
++            server.setConnectors(new Connector[]{httpsConn, httpConn});
++            server.setHandler(new ContextHandlerCollection(brokerStateContext, readinessContext));
+ 
+-        server.setStopTimeout(GRACEFUL_SHUTDOWN_TIMEOUT_MS);
+-        server.setStopAtShutdown(true);
+-        server.start();
++            server.setStopTimeout(GRACEFUL_SHUTDOWN_TIMEOUT_MS);
++            server.setStopAtShutdown(true);
++            server.start();
++        } catch (Exception e) {
++            //
++        }
+     }
+ 
+     /**
+@@ -225,10 +284,9 @@
+     /* test */ Handler getBrokerStateHandler() {
+         return new AbstractHandler() {
+             @Override
+-            public void handle(String s, Request baseRequest, HttpServletRequest request, HttpServletResponse response) throws IOException {
+-                response.setContentType("application/json");
+-                response.setCharacterEncoding("UTF-8");
+-                baseRequest.setHandled(true);
++            public boolean handle(Request request, Response response, Callback callback) throws Exception {
++                response.getHeaders().put(HttpHeader.CONTENT_TYPE, "application/json");
++                response.getHeaders().put(HttpHeader.CONTENT_ENCODING, "UTF-8");
+ 
+                 Map<String, Object> brokerStateResponse = new HashMap<>();
+                 if (brokerState != null) {
+@@ -244,16 +302,26 @@
+ 
+                     response.setStatus(HttpServletResponse.SC_OK);
+                     String json = new ObjectMapper().writeValueAsString(brokerStateResponse);
+-                    response.getWriter().print(json);
++                    Content.Sink.write(response, true, json, callback);
+                 } else {
+-                    response.setStatus(HttpServletResponse.SC_NOT_FOUND);
+-                    response.getWriter().print("Broker state metric not found");
++                    if (isController) {
++                        brokerStateResponse.put("brokerState", BROKER_RUNNING_STATE);
++                        response.setStatus(HttpServletResponse.SC_OK);
++
++                        String json = new ObjectMapper().writeValueAsString(brokerStateResponse);
++                        Content.Sink.write(response, true, json, callback);
++                    } else {
++                        response.setStatus(HttpServletResponse.SC_NOT_FOUND);
++                        Content.Sink.write(response, true, "Broker state metric not found", callback);
++                    }
+                 }
++
++                return true;
+             }
+         };
+     }
+ 
+-    private SslContextFactory getSSLContextFactory() {
++    private SslContextFactory.Server getSSLContextFactory() {
+         SslContextFactory.Server sslContextFactory = new SslContextFactory.Server();
+ 
+         sslContextFactory.setKeyStorePath(sslKeyStorePath);
+@@ -263,7 +331,7 @@
+         sslContextFactory.setTrustStorePath(sslTruststorePath);
+         sslContextFactory.setTrustStorePassword(sslTruststorePassword);
+         sslContextFactory.setNeedClientAuth(true);
+-        return  sslContextFactory;
++        return sslContextFactory;
+     }
+ 
+     /**
+@@ -271,73 +339,40 @@
+      *
+      * @return Handler
+      */
+-    /* test */ Handler getReadinessHandler() {
++    /* test */
++    Handler getReadinessHandler() {
+         return new AbstractHandler() {
+             @Override
+-            public void handle(String s, Request baseRequest, HttpServletRequest request, HttpServletResponse response) throws IOException {
+-                response.setContentType("application/json");
+-                response.setCharacterEncoding("UTF-8");
+-                baseRequest.setHandled(true);
++            public boolean handle(Request request, Response response, Callback callback) throws Exception {
++                response.getHeaders().put(HttpHeader.CONTENT_TYPE, "application/json");
++                response.getHeaders().put(HttpHeader.CONTENT_ENCODING, "UTF-8");
++
+                 if (brokerState != null) {
+                     byte observedState = (byte) brokerState.value();
+                     boolean stateIsRunning = BROKER_RUNNING_STATE <= observedState && BROKER_UNKNOWN_STATE != observedState;
+                     if (stateIsRunning) {
+                         LOGGER.trace("Broker is in running according to {}. The current state is {}", brokerStateName, observedState);
+                         response.setStatus(HttpServletResponse.SC_NO_CONTENT);
++                        Content.Sink.write(response, true, "", callback);
+                     } else {
+-                        LOGGER.trace("Broker is not running according to {}. The current state is {}", brokerStateName, observedState);
++                        LOGGER.warn("Broker is not running according to {}. The current state is {}", brokerStateName, observedState);
+                         response.setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+-                        response.getWriter().print("Readiness failed: brokerState is " + observedState);
++                        Content.Sink.write(response, true, "Readiness failed: brokerState is " + observedState, callback);
+                     }
+                 } else {
+-                    LOGGER.warn("Broker state metric not found");
+-                    response.setStatus(HttpServletResponse.SC_NOT_FOUND);
+-                    response.getWriter().print("Broker state metric not found");
+-                }
+-            }
+-        };
+-    }
+-
+-    /**
+-     * Agent entry point
+-     * @param agentArgs The agent arguments
+-     */
+-    public static void premain(String agentArgs) {
+-        String[] args = agentArgs.split(":");
+-        if (args.length != 1) {
+-            LOGGER.error("Not enough arguments to parse {}", agentArgs);
+-            System.exit(1);
+-        } else {
+-            final Properties agentProperties = new Properties();
+-            final Map<String, String> agentConfigs = new HashMap<>();
+-
+-            try (FileInputStream fis = new FileInputStream(args[0])) {
+-                agentProperties.load(fis);
+-                for (String key : agentProperties.stringPropertyNames()) {
+-                    agentConfigs.put(key, agentProperties.getProperty(key));
++                    if (isController) {
++                        LOGGER.trace("This is ControllerServer, not a broker");
++                        response.setStatus(HttpServletResponse.SC_NO_CONTENT);
++                        Content.Sink.write(response, true, "", callback);
++                    } else {
++                        LOGGER.warn("Broker state metric not found");
++                        response.setStatus(HttpServletResponse.SC_NOT_FOUND);
++                        Content.Sink.write(response, true, "Broker state metric not found", callback);
++                    }
+                 }
+-            } catch (IOException e) {
+-                LOGGER.error("Could not read and parse properties file {}", args[0]);
+-                System.exit(1);
+-            }
+ 
+-            final String sslKeyStorePath = agentConfigs.get("sslKeyStorePath");
+-            final String sslKeyStorePass = agentConfigs.get("sslKeyStorePass");
+-            final String sslTrustStorePath = agentConfigs.get("sslTrustStorePath");
+-            final String sslTrustStorePass = agentConfigs.get("sslTrustStorePass");
+-            if (sslKeyStorePath.isEmpty() || sslTrustStorePath.isEmpty()) {
+-                LOGGER.error("SSLKeyStorePath or SSLTrustStorePath is empty: sslKeyStorePath={} sslTrustStore={} ", sslKeyStorePath, sslTrustStorePath);
+-                System.exit(1);
+-            } else if (sslKeyStorePass.isEmpty()) {
+-                LOGGER.error("Keystore password is empty");
+-                System.exit(1);
+-            } else if (sslTrustStorePass.isEmpty()) {
+-                LOGGER.error("Truststore password is empty");
+-                System.exit(1);
+-            } else {
+-                LOGGER.info("Starting KafkaAgent with sslKeyStorePath={} and sslTrustStore={}", sslKeyStorePath, sslTrustStorePath);
+-                new KafkaAgent(sslKeyStorePath, sslKeyStorePass, sslTrustStorePath, sslTrustStorePass).run();
++                return true;
+             }
+-        }
++        };
+     }
+ }
+Index: kafka-agent/pom.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/kafka-agent/pom.xml b/kafka-agent/pom.xml
+--- a/kafka-agent/pom.xml	(revision d91e4044f42dde29bec1c8f5a710a6e9c61b6b63)
++++ b/kafka-agent/pom.xml	(date 1735561092000)
+@@ -9,6 +9,8 @@
+     </parent>
+     <modelVersion>4.0.0</modelVersion>
+ 
++    <version>0.46.0-kvmorozov</version>
++
+     <artifactId>kafka-agent</artifactId>
+ 
+     <properties>
+@@ -49,8 +51,8 @@
+             <scope>provided</scope>
+         </dependency>
+         <dependency>
+-            <groupId>javax.servlet</groupId>
+-            <artifactId>javax.servlet-api</artifactId>
++            <groupId>jakarta.servlet</groupId>
++            <artifactId>jakarta.servlet-api</artifactId>
+             <scope>provided</scope>
+         </dependency>
+         <dependency>
